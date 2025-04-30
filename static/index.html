@@ -1,0 +1,549 @@
+<!-- static/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Local Whisper Transcription</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                max-width: 800px;
+                margin: 0 auto;
+                padding: 20px;
+                line-height: 1.6;
+            }
+            .container {
+                display: flex;
+                flex-direction: column;
+                gap: 25px;
+            }
+            .card {
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                padding: 20px;
+                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+                background-color: #fff;
+            }
+            h1 {
+                color: #333;
+                margin-bottom: 10px;
+            }
+            h2 {
+                color: #444;
+                margin-bottom: 15px;
+            }
+            .buttons {
+                display: flex;
+                gap: 10px;
+                margin-top: 15px;
+            }
+            button {
+                padding: 10px 15px;
+                background-color: #4285f4;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 14px;
+                transition: background-color 0.2s;
+            }
+            button:hover {
+                background-color: #3367d6;
+            }
+            button:disabled {
+                background-color: #cccccc;
+                cursor: not-allowed;
+            }
+            .result {
+                margin-top: 20px;
+                white-space: pre-wrap;
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                padding: 15px;
+                min-height: 100px;
+                background-color: #f9f9f9;
+            }
+            .loader {
+                border: 4px solid #f3f3f3;
+                border-top: 4px solid #3498db;
+                border-radius: 50%;
+                width: 20px;
+                height: 20px;
+                animation: spin 2s linear infinite;
+                display: none;
+                margin-left: 10px;
+            }
+            @keyframes spin {
+                0% {
+                    transform: rotate(0deg);
+                }
+                100% {
+                    transform: rotate(360deg);
+                }
+            }
+            #recordingStatus {
+                color: #d32f2f;
+                font-weight: bold;
+                display: none;
+                margin-left: 15px;
+            }
+            .status-row {
+                display: flex;
+                align-items: center;
+                margin-top: 10px;
+            }
+            .input-file {
+                margin: 15px 0;
+            }
+            .model-info {
+                font-size: 14px;
+                color: #666;
+                margin-top: 5px;
+            }
+            .error {
+                color: #d32f2f;
+                margin-top: 10px;
+                font-size: 14px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Local Whisper Transcription</h1>
+            <p class="model-info">Using Whisper's local model for fast, private speech recognition</p>
+            <div
+                class="card"
+                id="httpsWarning"
+                style="background-color: #fff3cd; border-color: #ffeeba; color: #856404; display: none"
+            >
+                <p>
+                    <strong>Note:</strong> Microphone access requires HTTPS in modern browsers. If you're seeing
+                    microphone errors, make sure you're accessing this page via HTTPS or localhost.
+                </p>
+                <p>Current protocol: <span id="currentProtocol"></span></p>
+            </div>
+
+            <div class="card">
+                <h2>File to Text</h2>
+                <p>Upload an audio file for transcription</p>
+                <div class="input-file">
+                    <input type="file" id="audioFile" accept="audio/*" />
+                </div>
+                <div class="buttons">
+                    <button id="uploadButton">Transcribe File</button>
+                    <div id="fileLoader" class="loader"></div>
+                </div>
+                <div class="error" id="fileError"></div>
+                <div class="result" id="fileResult"></div>
+            </div>
+
+            <div class="card">
+                <h2>Real-time Transcription</h2>
+                <p>Transcribe your speech in real-time as you speak</p>
+                <div class="status-row">
+                    <div class="buttons">
+                        <button id="startRealTime">Start Real-time</button>
+                        <button id="stopRealTime" disabled>Stop Real-time</button>
+                    </div>
+                    <div
+                        id="realTimeStatus"
+                        style="color: #2196f3; font-weight: bold; display: none; margin-left: 15px"
+                    >
+                        ● Listening
+                    </div>
+                    <div id="realTimeLoader" class="loader"></div>
+                </div>
+                <div class="error" id="realTimeError"></div>
+                <div class="result" id="realTimeResult"></div>
+                <div style="margin-top: 10px; font-size: 0.9em; color: #666">
+                    Text will appear as you speak, with a slight delay. Perfect for longer dictations.
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>Microphone to Text (Record & Transcribe)</h2>
+                <p>Record audio from your microphone and transcribe it</p>
+                <div class="status-row">
+                    <div class="buttons">
+                        <button id="startRecording">Start Recording</button>
+                        <button id="stopRecording" disabled>Stop Recording</button>
+                    </div>
+                    <div id="recordingStatus">● Recording</div>
+                    <div id="micLoader" class="loader"></div>
+                </div>
+                <div class="error" id="micError"></div>
+                <div class="result" id="micResult"></div>
+            </div>
+        </div>
+
+        <script src="https://cdn.socket.io/4.6.0/socket.io.min.js"></script>
+        <script>
+            document.addEventListener('DOMContentLoaded', () => {
+                // Check if we're on HTTPS
+                const isSecureContext = window.isSecureContext;
+                const protocol = window.location.protocol;
+
+                // Show warning if needed
+                const httpsWarning = document.getElementById('httpsWarning');
+                const currentProtocol = document.getElementById('currentProtocol');
+
+                if (currentProtocol) {
+                    currentProtocol.textContent = protocol;
+                }
+
+                if (
+                    httpsWarning &&
+                    !isSecureContext &&
+                    protocol !== 'http:' &&
+                    !location.hostname.match(/localhost|127.0.0.1/)
+                ) {
+                    httpsWarning.style.display = 'block';
+                }
+                // File upload transcription
+                const uploadButton = document.getElementById('uploadButton');
+                const fileResult = document.getElementById('fileResult');
+                const fileLoader = document.getElementById('fileLoader');
+                const fileError = document.getElementById('fileError');
+                const audioFileInput = document.getElementById('audioFile');
+
+                uploadButton.addEventListener('click', async () => {
+                    const file = audioFileInput.files[0];
+                    if (!file) {
+                        fileError.textContent = 'Please select an audio file first';
+                        return;
+                    }
+
+                    // Clear previous results
+                    fileResult.textContent = 'Transcribing...';
+                    fileError.textContent = '';
+                    fileLoader.style.display = 'inline-block';
+                    uploadButton.disabled = true;
+
+                    // Create FormData
+                    const formData = new FormData();
+                    formData.append('audio', file);
+
+                    try {
+                        const response = await fetch('/api/transcribe', {
+                            method: 'POST',
+                            body: formData,
+                        });
+
+                        const data = await response.json();
+
+                        if (data.success) {
+                            fileResult.textContent = data.text;
+                        } else {
+                            fileError.textContent = `Error: ${data.error}`;
+                            fileResult.textContent = '';
+                        }
+                    } catch (error) {
+                        fileError.textContent = `Error: ${error.message}`;
+                        fileResult.textContent = '';
+                    } finally {
+                        fileLoader.style.display = 'none';
+                        uploadButton.disabled = false;
+                    }
+                });
+
+                // Real-time microphone transcription
+                const startRecordingButton = document.getElementById('startRecording');
+                const stopRecordingButton = document.getElementById('stopRecording');
+                const micResult = document.getElementById('micResult');
+                const micLoader = document.getElementById('micLoader');
+                const micError = document.getElementById('micError');
+                const recordingStatus = document.getElementById('recordingStatus');
+
+                let socket;
+                let audioContext;
+                let audioStream;
+                let processor;
+                let audioInput;
+
+                // Initialize Socket.IO
+                function initializeSocket() {
+                    // Get the current host
+                    const host = window.location.host;
+                    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+
+                    // Create socket connection
+                    socket = io(`${protocol}//${host}`);
+
+                    socket.on('connect', () => {
+                        console.log('Connected to server');
+                    });
+
+                    socket.on('disconnect', () => {
+                        console.log('Disconnected from server');
+                        stopRecording();
+                    });
+
+                    socket.on('recording-started', (data) => {
+                        console.log('Recording started on server');
+                    });
+
+                    socket.on('transcription-result', (data) => {
+                        if (data.success) {
+                            micResult.textContent = data.text;
+                        } else {
+                            micError.textContent = `Error: ${data.error}`;
+                            micResult.textContent = '';
+                        }
+                        micLoader.style.display = 'none';
+                    });
+
+                    socket.on('real-time-started', (data) => {
+                        console.log('Real-time transcription started on server');
+                    });
+
+                    socket.on('real-time-transcription', (data) => {
+                        if (data.success) {
+                            // Update the real-time result with the full text
+                            realTimeResult.textContent = data.full_text;
+
+                            // Scroll to the bottom of the result div
+                            realTimeResult.scrollTop = realTimeResult.scrollHeight;
+                        }
+                    });
+
+                    socket.on('real-time-complete', (data) => {
+                        if (data.success) {
+                            realTimeResult.textContent = data.text;
+                        } else {
+                            realTimeError.textContent = `Error: ${data.error}`;
+                        }
+                        realTimeLoader.style.display = 'none';
+                    });
+
+                    return socket;
+                }
+
+                // Start recording function
+                async function startRecording() {
+                    try {
+                        // Initialize Socket if not already done
+                        if (!socket) {
+                            socket = initializeSocket();
+                        }
+
+                        // Clear previous results
+                        micResult.textContent = '';
+                        micError.textContent = '';
+
+                        // Check if mediaDevices is supported
+                        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                            // Try older browser support
+                            const getUserMedia =
+                                navigator.getUserMedia ||
+                                navigator.webkitGetUserMedia ||
+                                navigator.mozGetUserMedia ||
+                                navigator.msGetUserMedia;
+
+                            if (!getUserMedia) {
+                                throw new Error(
+                                    'Your browser does not support microphone access. Try using Chrome, Firefox, or Edge on HTTPS.'
+                                );
+                            }
+
+                            // Use the older API
+                            audioStream = await new Promise((resolve, reject) => {
+                                getUserMedia.call(
+                                    navigator,
+                                    { audio: true },
+                                    (stream) => resolve(stream),
+                                    (err) => reject(err)
+                                );
+                            });
+                        } else {
+                            // Get access to the microphone using modern API
+                            audioStream = await navigator.mediaDevices.getUserMedia({
+                                audio: {
+                                    sampleRate: 16000,
+                                    channelCount: 1,
+                                },
+                            });
+                        }
+
+                        // Create AudioContext
+                        audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                            sampleRate: 16000,
+                        });
+
+                        // Create source node
+                        audioInput = audioContext.createMediaStreamSource(audioStream);
+
+                        // Create script processor node
+                        processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+                        processor.onaudioprocess = (e) => {
+                            // Only send data if we're recording
+                            if (stopRecordingButton.disabled === false) {
+                                // Get audio data from input buffer
+                                const inputData = e.inputBuffer.getChannelData(0);
+
+                                // Send audio data to server
+                                socket.emit('audio-data', Array.from(inputData));
+                            }
+                        };
+
+                        // Connect nodes
+                        audioInput.connect(processor);
+                        processor.connect(audioContext.destination);
+
+                        // Tell server we're starting to record
+                        socket.emit('start-recording');
+
+                        // Update UI
+                        startRecordingButton.disabled = true;
+                        stopRecordingButton.disabled = false;
+                        recordingStatus.style.display = 'inline-block';
+                    } catch (error) {
+                        micError.textContent = `Error accessing microphone: ${error.message}`;
+                        console.error('Error accessing microphone:', error);
+                    }
+                }
+
+                // Stop recording function
+                function stopRecording() {
+                    // Update UI
+                    startRecordingButton.disabled = false;
+                    stopRecordingButton.disabled = true;
+                    recordingStatus.style.display = 'none';
+                    micLoader.style.display = 'inline-block';
+
+                    // Tell server to stop recording and start transcription
+                    if (socket && socket.connected) {
+                        socket.emit('stop-recording');
+                    }
+
+                    // Stop microphone access
+                    if (audioStream) {
+                        audioStream.getTracks().forEach((track) => track.stop());
+                    }
+
+                    // Clean up audio context
+                    if (audioInput && processor) {
+                        audioInput.disconnect(processor);
+                        processor.disconnect(audioContext.destination);
+                    }
+
+                    if (audioContext && audioContext.state !== 'closed') {
+                        // Don't close, just suspend to allow reusing
+                        audioContext.suspend();
+                    }
+                }
+
+                // Event listeners for buttons
+                startRecordingButton.addEventListener('click', startRecording);
+                stopRecordingButton.addEventListener('click', stopRecording);
+
+                // Real-time transcription elements
+                const startRealTimeButton = document.getElementById('startRealTime');
+                const stopRealTimeButton = document.getElementById('stopRealTime');
+                const realTimeResult = document.getElementById('realTimeResult');
+                const realTimeLoader = document.getElementById('realTimeLoader');
+                const realTimeError = document.getElementById('realTimeError');
+                const realTimeStatus = document.getElementById('realTimeStatus');
+
+                let realTimeAudioContext;
+                let realTimeAudioStream;
+                let realTimeProcessor;
+                let realTimeAudioInput;
+
+                // Start real-time transcription function
+                async function startRealTime() {
+                    try {
+                        // Initialize Socket if not already done
+                        if (!socket) {
+                            socket = initializeSocket();
+                        }
+
+                        // Clear previous results
+                        realTimeResult.textContent = '';
+                        realTimeError.textContent = '';
+
+                        // Get access to the microphone
+                        realTimeAudioStream = await navigator.mediaDevices.getUserMedia({
+                            audio: {
+                                sampleRate: 16000,
+                                channelCount: 1,
+                            },
+                        });
+
+                        // Create AudioContext
+                        realTimeAudioContext = new (window.AudioContext || window.webkitAudioContext)({
+                            sampleRate: 16000,
+                        });
+
+                        // Create source node
+                        realTimeAudioInput = realTimeAudioContext.createMediaStreamSource(realTimeAudioStream);
+
+                        // Create script processor node
+                        realTimeProcessor = realTimeAudioContext.createScriptProcessor(4096, 1, 1);
+
+                        realTimeProcessor.onaudioprocess = (e) => {
+                            // Only send data if we're in real-time mode
+                            if (stopRealTimeButton.disabled === false) {
+                                // Get audio data from input buffer
+                                const inputData = e.inputBuffer.getChannelData(0);
+
+                                // Send audio data to server
+                                socket.emit('audio-data', Array.from(inputData));
+                            }
+                        };
+
+                        // Connect nodes
+                        realTimeAudioInput.connect(realTimeProcessor);
+                        realTimeProcessor.connect(realTimeAudioContext.destination);
+
+                        // Tell server we're starting real-time transcription
+                        socket.emit('start-real-time');
+
+                        // Update UI
+                        startRealTimeButton.disabled = true;
+                        stopRealTimeButton.disabled = false;
+                        realTimeStatus.style.display = 'inline-block';
+                    } catch (error) {
+                        realTimeError.textContent = `Error accessing microphone: ${error.message}`;
+                        console.error('Error accessing microphone for real-time:', error);
+                    }
+                }
+
+                // Stop real-time transcription function
+                function stopRealTime() {
+                    // Update UI
+                    startRealTimeButton.disabled = false;
+                    stopRealTimeButton.disabled = true;
+                    realTimeStatus.style.display = 'none';
+                    realTimeLoader.style.display = 'inline-block';
+
+                    // Tell server to stop real-time transcription
+                    if (socket && socket.connected) {
+                        socket.emit('stop-real-time');
+                    }
+
+                    // Stop microphone access
+                    if (realTimeAudioStream) {
+                        realTimeAudioStream.getTracks().forEach((track) => track.stop());
+                    }
+
+                    // Clean up audio context
+                    if (realTimeAudioInput && realTimeProcessor) {
+                        realTimeAudioInput.disconnect(realTimeProcessor);
+                        realTimeProcessor.disconnect(realTimeAudioContext.destination);
+                    }
+
+                    if (realTimeAudioContext && realTimeAudioContext.state !== 'closed') {
+                        // Don't close, just suspend to allow reusing
+                        realTimeAudioContext.suspend();
+                    }
+                }
+
+                // Event listeners for real-time buttons
+                startRealTimeButton.addEventListener('click', startRealTime);
+                stopRealTimeButton.addEventListener('click', stopRealTime);
+            });
+        </script>
+    </body>
+</html>
