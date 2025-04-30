@@ -401,8 +401,8 @@ if __name__ == '__main__':
     
     # Check if SSL certificates are provided for HTTPS
     ssl_context = None
-    cert_file = os.environ.get('SSL_CERT_FILE')
-    key_file = os.environ.get('SSL_KEY_FILE')
+    cert_file = 'ssl/cert.pem'
+    key_file = 'ssl/key.pem'
     
     if cert_file and key_file and os.path.exists(cert_file) and os.path.exists(key_file):
         ssl_context = (cert_file, key_file)
