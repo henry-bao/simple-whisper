@@ -74,7 +74,7 @@ if not os.path.exists(UPLOAD_FOLDER):
 
 # Initialize Whisper model
 # Model options: "tiny", "base", "small", "medium", "large"
-MODEL_SIZE = "base"
+MODEL_SIZE = "tiny"
 logger.info(f"Loading Whisper {MODEL_SIZE} model...")
 model = whisper.load_model(MODEL_SIZE)
 logger.info("Model loaded successfully!")
