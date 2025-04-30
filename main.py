@@ -15,6 +15,53 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def text_to_svg(text):
+    """Convert text to an SVG representation."""
+    if not text:
+        return '<svg xmlns="http://www.w3.org/2000/svg" width="800" height="100"></svg>'
+    
+    # Basic SVG settings
+    svg_width = 800
+    line_height = 24
+    font_size = 16
+    x_pos = 20
+    
+    # Split text into lines (approximately 80 chars per line)
+    words = text.split()
+    lines = []
+    current_line = []
+    current_length = 0
+    
+    for word in words:
+        if current_length + len(word) + 1 > 80:  # +1 for the space
+            lines.append(' '.join(current_line))
+            current_line = [word]
+            current_length = len(word)
+        else:
+            current_line.append(word)
+            current_length += len(word) + 1
+    
+    if current_line:
+        lines.append(' '.join(current_line))
+    
+    # Calculate SVG height based on number of lines
+    svg_height = max(100, (len(lines) * line_height) + 40)
+    
+    # Create SVG header
+    svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{svg_width}" height="{svg_height}">'
+    
+    # Add rectangle background
+    svg += f'<rect width="100%" height="100%" fill="#f9f9f9" />'
+    
+    # Add text elements for each line
+    for i, line in enumerate(lines):
+        y_pos = (i * line_height) + 30
+        svg += f'<text x="{x_pos}" y="{y_pos}" font-family="Arial, sans-serif" font-size="{font_size}" fill="#333">{line}</text>'
+    
+    # Close SVG
+    svg += '</svg>'
+    return svg
+
 # Initialize Flask app
 app = Flask(__name__, static_folder='static')
 CORS(app)
@@ -108,10 +155,14 @@ class RecordingSession:
                                 else:
                                     self.accumulated_text += " " + transcribed_text
                                 
+                                # Convert to SVG
+                                svg_output = text_to_svg(self.accumulated_text)
+                                
                                 # Send intermediate result back to client
                                 socketio.emit('real-time-transcription', {
                                     "text": transcribed_text,
                                     "full_text": self.accumulated_text,
+                                    "svg": svg_output,
                                     "success": True
                                 }, room=self.sid)
                             
@@ -220,8 +271,13 @@ def transcribe_file():
         # Clean up the uploaded file
         os.remove(filepath)
         
+        # Convert text to SVG
+        text = result["text"]
+        svg_output = text_to_svg(text)
+        
         return jsonify({
-            "text": result["text"],
+            "text": text,
+            "svg": svg_output,
             "success": True
         })
     
@@ -320,9 +376,14 @@ def handle_stop_recording():
                     logger.info(f"Transcribing audio for session {current_sid}")
                     result = model.transcribe(audio_path)
                     
+                    # Convert to SVG
+                    text = result["text"]
+                    svg_output = text_to_svg(text)
+                    
                     # Send result back to client
                     socketio.emit('transcription-result', {
-                        "text": result["text"],
+                        "text": text,
+                        "svg": svg_output,
                         "success": True
                     }, room=current_sid)
                     
@@ -372,12 +433,16 @@ def handle_stop_real_time():
             # Get the accumulated text
             final_text = session.accumulated_text
             
+            # Convert to SVG
+            svg_output = text_to_svg(final_text)
+            
             # Stop the real-time processing
             session.stop_recording()
             
             # Send final result back to client
             emit('real-time-complete', {
                 "text": final_text,
+                "svg": svg_output,
                 "success": True
             })
             
