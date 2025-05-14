@@ -1,56 +1,74 @@
-
-#!/usr/bin/env python3
-"""
-Flask Plotter App for Raspberry Pi with explicit pen up/down for AxiDraw
-
-Installs & dependencies:
-  sudo apt update
-  sudo apt install -y inkscape libatlas-base-dev python3-pip
-  pip3 install --upgrade pip
-  pip3 uninstall -y whisper
-  pip3 install openai-whisper flask flask-socketio flask-cors soundfile numpy pyaxidraw
-
-Usage:
-  Save as direct_plotter.py on your Pi
-  python3 direct_plotter.py
-  Then record & POST:
-    arecord -D plughw:1,0 -f S16_LE -c1 -r 16000 -d 5 test.wav
-    curl -X POST -F "audio=@test.wav" http://10.56.129.225:8080/api/transcribe
-"""
 import os
 import uuid
 import tempfile
-import logging
+import threading
 import subprocess
-from flask import Flask, request, jsonify, send_from_directory
-from flask_socketio import SocketIO
-from flask_cors import CORS
-import whisper
+import logging
+import time
 import numpy as np
 import soundfile as sf
+
+from flask import Flask, request, jsonify, send_from_directory
+from flask_socketio import SocketIO, emit
+from flask_cors import CORS
+
+import whisper
+from pyaxidraw import axidraw
 
 # ——— Setup & Logging ———
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ——— Flask + SocketIO Init ———
 app = Flask(__name__, static_folder='static')
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Ensure working directories exist
-dir_paths = ['uploads', 'svg']
-for d in dir_paths:
-    os.makedirs(d, exist_ok=True)
-
-# Load Whisper model locally
-audio_model = whisper.load_model(os.getenv('MODEL_SIZE', 'tiny'))
+# ——— Whisper Model ———
+MODEL_SIZE = os.getenv('MODEL_SIZE', 'tiny')
+logger.info(f"Loading Whisper {MODEL_SIZE} model...")
+model = whisper.load_model(MODEL_SIZE)
 logger.info("Whisper model loaded.")
 
-# ——— SVG Pipeline Helpers ———
+# ——— File Folders ———
+UPLOAD_FOLDER = os.path.join(os.getcwd(), 'uploads')
+SVG_FOLDER    = os.path.join(os.getcwd(), 'svg')
+for d in (UPLOAD_FOLDER, SVG_FOLDER):
+    os.makedirs(d, exist_ok=True)
+
+# ——— Recording Session Class ———
+class RecordingSession:
+    def __init__(self, sid):
+        self.sid = sid
+        self.chunks = []
+        self.thread = None
+        self.processing = False
+
+    def add_chunk(self, chunk):
+        arr = np.array(chunk, dtype=np.float32) if isinstance(chunk, list) else chunk
+        self.chunks.append(arr)
+
+    def stop_and_save(self):
+        if not self.chunks:
+            return None
+        data = np.concatenate(self.chunks)
+        path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4()}.wav")
+        sf.write(path, data, 16000)
+        return path
+
+active_sessions = {}
+
+# ——— SVG Helpers ———
 def text_to_svg(text: str) -> str:
-    if not text:
-        return '<svg xmlns="http://www.w3.org/2000/svg" width="800" height="100"></svg>'
-    W, LH, FS, X0 = 800, 24, 16, 20
+    """
+    Convert text to an SVG postcard of exactly 576×384 px,
+    with the text block centered both horizontally and vertically.
+    """
+    W, H = 576, 384               # canvas size
+    LH, FS = 24, 16               # line‐height & font‐size
+    X_CENTER = W / 2
+
+    # Split into ~80-char lines (same as before)
     words = text.split()
     lines, cur, length = [], [], 0
     for w in words:
@@ -60,112 +78,140 @@ def text_to_svg(text: str) -> str:
             cur.append(w); length += len(w) + 1
     if cur:
         lines.append(' '.join(cur))
-    H = max(100, len(lines) * LH + 40)
-    svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}">' \
-          + '<rect width="100%" height="100%" fill="#FFF"/>'
+
+    # Compute vertical centering
+    num_lines = len(lines)
+    text_block_height = num_lines * LH
+    # y of first baseline so block is vertically centered
+    start_y = (H - text_block_height) / 2 + FS
+
+    # Build SVG
+    svg = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}">',
+        # white background
+        f'<rect width="100%" height="100%" fill="#FFF"/>'
+    ]
+
+    # Add each line, centered via text-anchor="middle"
     for i, line in enumerate(lines):
-        y_pos = 30 + i * LH
-        svg += f'<text x="{X0}" y="{y_pos}" font-family="Arial" font-size="{FS}" fill="#000">{line}</text>'
-    svg += '</svg>'
-    return svg
+        y = start_y + i * LH
+        svg.append(
+            f'<text x="{X_CENTER}" y="{y}" '
+            f'font-family="Arial, sans-serif" font-size="{FS}" '
+            f'fill="#000" text-anchor="middle">{line}</text>'
+        )
+
+    svg.append('</svg>')
+    return "\n".join(svg)
 
 
-def save_svg(svg_str: str, filepath: str) -> str:
+def save_svg(svg_str: str, filepath: str):
     with open(filepath, 'w') as f:
         f.write(svg_str)
-    logger.info(f"→ SVG saved: {filepath}")
-    return filepath
+    logger.info(f"SVG saved: {filepath}")
 
-
-def svg_to_path(raw_svg: str, out_svg: str) -> str:
+def svg_to_path(in_svg: str, out_svg: str):
     subprocess.run([
-        'inkscape', raw_svg,
+        'inkscape', in_svg,
         f'--export-plain-svg={out_svg}',
         '--export-text-to-path'
     ], check=True)
-    logger.info(f"→ Converted to paths: {out_svg}")
-    return out_svg
+    logger.info(f"Converted to paths: {out_svg}")
 
-# ——— AxiDraw Plotting with Pen Up/Down ———
+# ——— AxiDraw Plotter ———
 def plot_with_axi(svg_file: str, port: str = "/dev/ttyACM0"):
-    """
-    Use AxiDraw interactive mode, explicit port, pen up/down,
-    then plot the given SVG.
-    """
-    try:
-        from pyaxidraw import axidraw
-    except ImportError:
-        try:
-            from axidraw import axidraw
-        except ImportError:
-            logger.error("AxiDraw module not found. Install pyaxidraw or AxiDraw_API.zip.")
-            return
-
     ad = axidraw.AxiDraw()
-    logger.info("Entering interactive mode for manual port config...")
     ad.interactive()
     ad.options.port = port
+    ad.options.pen_pos_up = 100
+    ad.options.pen_pos_down = 0
+    if not ad.connect():
+        logger.error(f"Cannot connect to AxiDraw on {port}")
+        return
+    try:
+        ad.penup()
+        ad.plot_setup(svg_file)
+        ad.pendown()
+        ad.plot_run()
+        ad.penup()
+        logger.info("Plot complete.")
+    finally:
+        ad.disconnect()
 
-    if ad.connect():
-        logger.info(f"✅ AxiDraw connected on {port}")
+# ——— Static Route ———
+@app.route('/')
+def index():
+    return send_from_directory(app.static_folder, 'index.html')
+
+# ——— Socket.IO Events ———
+@socketio.on('start-recording')
+def on_start():
+    sid = request.sid
+    active_sessions[sid] = RecordingSession(sid)
+    emit('recording-started', {"success": True})
+
+@socketio.on('audio-data')
+def on_audio(data):
+    sid = request.sid
+    if sid in active_sessions:
+        active_sessions[sid].add_chunk(data)
+
+@socketio.on('stop-recording')
+def on_stop():
+    sid = request.sid
+    sess = active_sessions.get(sid)
+    if not sess or sess.processing:
+        emit('transcription-result', {"success": False, "error": "Session error"})
+        return
+
+    sess.processing = True
+
+    def worker():
         try:
-            # Lift pen before any movement
-            ad.penup()
+            wav = sess.stop_and_save()
+            if not wav:
+                raise RuntimeError("No audio captured")
+            # Transcribe
+            res = model.transcribe(wav)
+            text = res.get('text','').strip()
+            os.remove(wav)
 
-            # Move to start and load SVG
-            ad.plot_setup(svg_file)
+            # Text→SVG
+            raw_svg = os.path.join(SVG_FOLDER, f"{uuid.uuid4()}_raw.svg")
+            save_svg(text_to_svg(text), raw_svg)
 
-            # Lower pen to start drawing
-            ad.pendown()
+            # Paths→Ready SVG
+            ready_svg = os.path.join(SVG_FOLDER, f"{uuid.uuid4()}_ready.svg")
+            svg_to_path(raw_svg, ready_svg)
 
-            # Run the plot
-            ad.plot_run()
+            # Plot
+            plot_with_axi(ready_svg)
 
-            # Lift pen when done
-            ad.penup()
+            # Return to client
+            socketio.emit('transcription-result', {
+                "success": True,
+                "text": text,
+                "svg": open(raw_svg).read()
+            }, room=sid)
 
-            logger.info("→ Plot run complete.")
         except Exception as e:
-            logger.error(f"Plotting error: {e}")
+            logger.exception("Error in processing")
+            socketio.emit('transcription-result', {
+                "success": False,
+                "error": str(e)
+            }, room=sid)
         finally:
-            try:
-                ad.disconnect()
-            except Exception:
-                pass
-    else:
-        logger.error(f"❌ Failed to connect to AxiDraw on {port}")
+            # Clean-up
+            del active_sessions[sid]
 
-# ——— HTTP Endpoint ———
-@app.route('/api/transcribe', methods=['POST'])
-def api_transcribe():
-    if 'audio' not in request.files:
-        return jsonify(success=False, error="No audio file"), 400
+    threading.Thread(target=worker, daemon=True).start()
 
-    # Save upload
-    wf = request.files['audio']
-    wav_name = f"{uuid.uuid4()}.wav"
-    wav_path = os.path.join('uploads', wav_name)
-    wf.save(wav_path)
-
-    # Transcribe
-    logger.info(f"Transcribing {wav_path}")
-    result = audio_model.transcribe(wav_path)
-    os.remove(wav_path)
-    text = result.get('text', '').strip()
-    logger.info(f"Transcript: {text}")
-
-    # SVG pipeline
-    raw_svg = os.path.join('svg', f"{uuid.uuid4()}_raw.svg")
-    save_svg(text_to_svg(text), raw_svg)
-    ready_svg = os.path.join('svg', f"{uuid.uuid4()}_ready.svg")
-    svg_to_path(raw_svg, ready_svg)
-
-    # Plot
-    plot_with_axi(ready_svg)
-
-    return jsonify(success=True, text=text)
-
+# ——— Run Server ———
 if __name__ == '__main__':
-    HOST, PORT = '0.0.0.0', 8080
-    logger.info(f"Server listening at http://{HOST}:{PORT}")
-    socketio.run(app, host=HOST, port=PORT, debug=True)
+    port = int(os.environ.get('PORT', 5505))
+    ssl_ctx = None
+    cert, key = 'ssl/cert.pem','ssl/key.pem'
+    if os.path.exists(cert) and os.path.exists(key):
+        ssl_ctx = (cert, key)
+        logger.info("Using HTTPS")
+    socketio.run(app, host='0.0.0.0', port=port, ssl_context=ssl_ctx, debug=True)
